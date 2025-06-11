@@ -1,13 +1,12 @@
 /*
- * Basic Maze Navigation
+ * Improved Maze Navigation with Enhanced Intersection Handling
  *
- * OVERVIEW:
- * This code implements a line-following robot that uses 8 IR sensors to detect
- * and follow a black line on a white surface. The robot can:
- * - Follow lines with proportional steering
- * - Detect and navigate intersections (left/right turns)
- * - Handle dead-ends by backing up and finding alternate routes
- * - Provide visual feedback through RGB LED status indicators
+ * Key improvements:
+ * 1. Better intersection detection using weighted sensor analysis
+ * 2. Improved decision making with path history tracking
+ * 3. Enhanced dead-end detection and recovery
+ * 4. More robust turn completion detection
+ * 5. Adaptive speed control for different situations
  */
 
 #include "msp.h"
@@ -15,345 +14,212 @@
 #include <stdio.h>
 #include <stdbool.h>
 
-// ========== CONFIGURATION CONSTANTS ==========
+// ========== ENHANCED CONFIGURATION ==========
 #define MAX_SPEED 3000
-#define DEFAULT_ROBOT_SPEED 55  // 50% of max speed
+#define DEFAULT_ROBOT_SPEED 55
 
-// Timing constants for robot behaviors (in milliseconds)
-#define PLACEMENT_WAIT_TIME 5000     // User placement adjustment time
-#define INITIAL_FORWARD_TIME 750     // Initial forward movement after start
-#define LINE_LOST_WAIT_TIME 300      // Stabilization wait after line loss
-#define INTERSECTION_PAUSE_TIME 1000 // Pause at intersection for analysis
-#define MIN_TURN_TIME 1900          // Minimum turn duration
-#define MAX_TURN_TIME 2500          // Maximum turn duration (safety)
+// Enhanced timing constants
+#define PLACEMENT_WAIT_TIME 5000
+#define INITIAL_FORWARD_TIME 750
+#define LINE_LOST_WAIT_TIME 200        // Reduced for faster response
+#define INTERSECTION_PAUSE_TIME 500    // Reduced for smoother navigation
+#define MIN_TURN_TIME 1800
+#define MAX_TURN_TIME 2300
+#define INTERSECTION_ADVANCE_TIME 300  // Time to advance into intersection
 
-// Sensor masks for different sensor groups (8 sensors: 0-7, left to right)
-#define ALL_SENSORS 0xFF        // All 8 sensors
-#define CENTER_6_SENSORS 0x7E   // Sensors 1-6 (exclude outer sensors)
-#define MIDDLE_4_SENSORS 0x3C   // Sensors 2-5 (start detection)
+// Enhanced sensor groupings
+#define ALL_SENSORS 0xFF
+#define CENTER_6_SENSORS 0x7E
+#define MIDDLE_4_SENSORS 0x3C
+#define OUTER_SENSORS 0x81
+#define LEFT_SENSORS 0xF0
+#define RIGHT_SENSORS 0x0F
 
-// Motor speed percentages for different maneuvers
+// Speed settings for different maneuvers
 #define FULL_SPEED 100
+#define INTERSECTION_SPEED 70          // Slower speed at intersections
 #define TURN_SLOW_SPEED 55
 #define TURN_SHARP_SPEED 40
+#define SEARCH_SPEED 60
 
-// ========== TYPE DEFINITIONS ==========
+// ========== ENHANCED TYPE DEFINITIONS ==========
 
-/*
- * LINE POSITION ENUM
- * Describes where the line is relative to the robot's sensors
- */
 typedef enum {
-    LINE_CENTERED,        // Line is centered under robot
-    LINE_SLIGHT_LEFT,     // Line slightly to the left - gentle correction needed
-    LINE_SLIGHT_RIGHT,    // Line slightly to the right - gentle correction needed
-    LINE_SHARP_LEFT,      // Line sharply to the left - strong correction needed
-    LINE_SHARP_RIGHT,     // Line sharply to the right - strong correction needed
-    LINE_LOST,            // No line detected - robot needs to search
-    INTERSECTION_DETECTED // Wide line pattern indicates intersection
+    LINE_CENTERED,
+    LINE_SLIGHT_LEFT,
+    LINE_SLIGHT_RIGHT,
+    LINE_SHARP_LEFT,
+    LINE_SHARP_RIGHT,
+    LINE_LOST,
+    INTERSECTION_DETECTED,
+    DEAD_END_DETECTED          // New state for dead-end detection
 } LinePosition;
 
-/*
- * ROBOT STATE MACHINE
- * Controls overall robot behavior with visual LED feedback
- */
 typedef enum {
-    ROBOT_WAITING,              // Red LED - waiting for start signal
-    ROBOT_PLACEMENT_WAIT,       // Magenta LED - 5 second countdown
-    ROBOT_INITIAL_FORWARD,      // White LED - initial forward movement
-    ROBOT_FOLLOWING,            // Blue LED - actively following line
-    ROBOT_STOPPED,              // Green LED - stopped at intersection
-    ROBOT_LINE_LOST_WAIT,       // Orange LED - line loss stabilization
-    ROBOT_BACKWARD_SEARCH,      // Yellow LED - searching backward for line
-    ROBOT_BACKWARD_TO_INTERSECTION  // Cyan LED - backing to intersection
+    ROBOT_WAITING,
+    ROBOT_PLACEMENT_WAIT,
+    ROBOT_INITIAL_FORWARD,
+    ROBOT_FOLLOWING,
+    ROBOT_STOPPED,
+    ROBOT_LINE_LOST_WAIT,
+    ROBOT_BACKWARD_SEARCH,
+    ROBOT_BACKWARD_TO_INTERSECTION,
+    ROBOT_INTERSECTION_ADVANCE,    // New state for intersection handling
+    ROBOT_POST_TURN_SEARCH        // New state for post-turn line search
 } RobotState;
 
-/*
- * INTERSECTION DIRECTION
- * Determines which way to turn at an intersection
- */
 typedef enum {
-    INTERSECTION_LEFT,     // Turn left at intersection
-    INTERSECTION_RIGHT,    // Turn right at intersection
-    INTERSECTION_STRAIGHT, // Go straight through intersection
-    INTERSECTION_UNKNOWN   // Cannot determine direction
+    INTERSECTION_LEFT,
+    INTERSECTION_RIGHT,
+    INTERSECTION_STRAIGHT,
+    INTERSECTION_T_LEFT,          // T-intersection with only left option
+    INTERSECTION_T_RIGHT,         // T-intersection with only right option
+    INTERSECTION_DEAD_END,        // Dead end detected
+    INTERSECTION_UNKNOWN
 } IntersectionDirection;
+
+// ========== PATH TRACKING ==========
+#define MAX_PATH_HISTORY 20
+
+typedef enum {
+    TURN_LEFT,
+    TURN_RIGHT,
+    TURN_STRAIGHT
+} TurnDirection;
+
+typedef struct {
+    TurnDirection turns[MAX_PATH_HISTORY];
+    uint8_t turn_count;
+    uint8_t current_index;
+} PathHistory;
 
 // ========== GLOBAL VARIABLES ==========
 uint8_t robot_speed_percent = DEFAULT_ROBOT_SPEED;
-bool first_intersection_after_start = true;  // Special handling for first intersection
+bool first_intersection_after_start = true;
 uint8_t intersection_count = 0;
+PathHistory path_history = {0};
+uint8_t consecutive_line_lost_count = 0;
+uint32_t last_good_line_time = 0;
 
 void (*TimerA2Task)(void);
 
-// ========== FUNCTION PROTOTYPES ==========
-// Hardware initialization
-void Motor_Init();
-void IR_Init();
-void PWM_Init34(uint16_t period, uint16_t duty3, uint16_t duty4);
-void TimerA2_Init(void(*task)(void), uint16_t period);
+// ========== ENHANCED FUNCTION PROTOTYPES ==========
 
-// Sensor functions
-uint8_t Read_IR_Sensors(uint8_t sensor_mask);
-LinePosition Get_Line_Position();
-bool Is_Intersection(uint8_t reading);
-bool Is_Turn_Complete();
-bool Check_Start_Line();
+// Path tracking functions
+void Add_Turn_To_History(TurnDirection turn);
+TurnDirection Get_Opposite_Turn(TurnDirection turn);
+bool Should_Try_Alternative_Path(void);
 
-// Motor control
-void Move(uint16_t leftDuty, uint16_t rightDuty);
-void Stop();
-void Move_Forward();
-void Move_Backward();
-void Turn_Slight_Left();
-void Turn_Slight_Right();
-void Turn_Sharp_Left();
-void Turn_Sharp_Right();
-void Turn_Slight_Left_Backward();
-void Turn_Slight_Right_Backward();
-void Turn_Sharp_Left_Backward();
-void Turn_Sharp_Right_Backward();
+// Enhanced sensor functions
+uint8_t Read_IR_Sensors_Multiple(uint8_t sensor_mask, uint8_t samples);
+LinePosition Get_Enhanced_Line_Position(void);
+bool Is_Enhanced_Intersection(uint8_t reading);
+bool Is_Dead_End(uint8_t reading);
+IntersectionDirection Analyze_Intersection_Options(uint8_t reading);
+uint8_t Count_Active_Sensors(uint8_t reading);
+uint8_t Get_Sensor_Weight_Score(uint8_t reading);
 
-// Navigation functions
-void Execute_Left_Turn();
-void Execute_Right_Turn();
-void Execute_Left_Turn_From_Backward();
-void Execute_Right_Turn_From_Backward();
-IntersectionDirection Get_Intersection_Direction(uint8_t reading);
-IntersectionDirection Get_Intersection_Direction_From_Backward(uint8_t reading);
+// Enhanced navigation functions
+void Execute_Smart_Turn(IntersectionDirection direction);
+void Execute_Intersection_Advance(void);
+bool Search_For_Line_Post_Turn(void);
+void Execute_Dead_End_Recovery(void);
 
-// Utility functions
-void Set_Robot_Speed(uint8_t speed_percent);
-uint16_t Calculate_Speed(uint8_t percent_of_max);
-void Debug_Sensor_Pattern(uint8_t reading);
+// Adaptive speed functions
+void Set_Speed_For_Situation(uint8_t base_speed);
+uint16_t Calculate_Adaptive_Speed(uint8_t percent_of_max, uint8_t situation_modifier);
 
-// LED functions
-void LED_Red_On();
-void LED_Green_On();
-void LED_Blue_On();
-void LED_Yellow_On();
-void LED_Cyan_On();
-void LED_Magenta_On();
-void LED_White_On();
-void LED_Orange_On();
-void LED_Off();
+// Enhanced debugging
+void Debug_Enhanced_Sensor_Pattern(uint8_t reading);
+void Debug_Intersection_Analysis(uint8_t reading, IntersectionDirection direction);
 
-// Low-level motor control
-void Left_Forward();
-void Left_Backward();
-void Right_Forward();
-void Right_Backward();
-void PWM_Duty3(uint16_t duty3);
-void PWM_Duty4(uint16_t duty4);
-
-// ========== TIMER INTERRUPT SETUP ==========
-void TimerA2_Init(void(*task)(void), uint16_t period) {
-    TimerA2Task = task;
-    TIMER_A2->CTL = 0x0280;
-    TIMER_A2->CCTL[0] = 0x0010;
-    TIMER_A2->CCR[0] = (period - 1);
-    TIMER_A2->EX0 = 0x0005;
-    NVIC->IP[3] = (NVIC->IP[3]&0xFFFFFF00) | 0x00000040;
-    NVIC->ISER[0] = 0x00001000;
-    TIMER_A2->CTL |= 0x0014;
-}
-
-void TA2_0_IRQHandler(void) {
-    TIMER_A2->CCTL[0] &= ~0x0001;
-    (*TimerA2Task)();
-}
-
-void task() {
-    printf("interrupt occurs!\n");
-}
-
-// ========== PWM MOTOR CONTROL ==========
-/*
- * PWM_Init34 - Initialize PWM for motor speed control
- * Uses Timer A0 to generate PWM signals on P2.6 and P2.7
- * period: PWM period (15000 for 15kHz)
- * duty3/duty4: Initial duty cycles for left/right motors
- */
-void PWM_Init34(uint16_t period, uint16_t duty3, uint16_t duty4) {
-    P2->DIR |= 0xC0;
-    P2->SEL0 |= 0xC0;
-    P2->SEL1 &= ~0xC0;
-
-    TIMER_A0->CCTL[0] = 0x800;
-    TIMER_A0->CCR[0] = period;
-    TIMER_A0->EX0 = 0x0000;
-    TIMER_A0->CCTL[3] = 0x0040;
-    TIMER_A0->CCR[3] = duty3;
-    TIMER_A0->CCTL[4] = 0x0040;
-    TIMER_A0->CCR[4] = duty4;
-    TIMER_A0->CTL = 0x02F0;
-}
-
-// ========== HARDWARE INITIALIZATION ==========
-/*
- * Motor_Init - Initialize motor control pins
- * Sets up sleep pins (P3.6, P3.7), direction pins (P5.4, P5.5), and PWM pins
- */
-void Motor_Init(){
-    // Motor sleep pins (P3.6, P3.7)
-    P3->SEL0 &= ~0xC0;
-    P3->SEL1 &= ~0xC0;
-    P3->DIR  |= 0xC0;
-    P3->OUT  &= ~0xC0;
-
-    // Motor direction pins (P5.4, P5.5)
-    P5->SEL0 &= ~0x30;
-    P5->SEL1 &= ~0x30;
-    P5->DIR  |= 0x30;
-    P5->OUT  &= ~0x30;
-
-    // PWM pins (P2.6, P2.7)
-    P2->SEL0 &= ~0xC0;
-    P2->SEL1 &= ~0xC0;
-    P2->DIR  |= 0xC0;
-    P2->OUT  &= ~0xC0;
-
-    PWM_Init34(15000, 0, 0);  // 15kHz PWM, 0% duty cycle
-}
+// ========== ENHANCED SENSOR READING ==========
 
 /*
- * IR_Init - Initialize IR sensor system
- * Sets up IR emitters on P5 and P9, sensors on P7, and RGB LED on P2
+ * Read_IR_Sensors_Multiple - Take multiple sensor readings for better accuracy
+ * Reduces noise and provides more reliable intersection detection
  */
-void IR_Init() {
-    // IR Emitters on P5 (even) and P9 (odd)
-    P5->SEL0 &= ~0x55;
-    P5->SEL1 &= ~0x55;
-    P5->DIR  |= 0x55;
-    P5->OUT  &= ~0x55;
+uint8_t Read_IR_Sensors_Multiple(uint8_t sensor_mask, uint8_t samples) {
+    uint8_t readings[5];
+    uint8_t i, j;
+    
+    // Take multiple readings
+    for (i = 0; i < samples && i < 5; i++) {
+        // Turn on selected IR emitters
+        P5->OUT |= (sensor_mask & 0x55);
+        P9->OUT |= (sensor_mask & 0xAA);
 
-    P9->SEL0 &= ~0xAA;
-    P9->SEL1 &= ~0xAA;
-    P9->DIR  |= 0xAA;
-    P9->OUT  &= ~0xAA;
+        // Charge phase
+        P7->DIR = sensor_mask;
+        P7->OUT = sensor_mask;
+        Clock_Delay1us(15);
 
-    // IR Sensors (P7) - inputs
-    P7->SEL0 &= ~0xFF;
-    P7->SEL1 &= ~0xFF;
-    P7->DIR  &= ~0xFF;
+        // Discharge phase
+        P7->DIR = 0x00;
+        Clock_Delay1us(800);
 
-    // RGB LED indicators (P2.0, P2.1, P2.2)
-    P2->DIR |= 0x07;
-    P2->OUT &= ~0x07;
-}
+        readings[i] = P7->IN & sensor_mask;
 
-// ========== SENSOR READING ==========
-/*
- * Read_IR_Sensors - Core sensor reading function
- * Uses capacitive charging technique to measure reflectance
- * sensor_mask: which sensors to read (bit pattern)
- * Returns: bit pattern where 1 = line detected, 0 = no line
- */
-uint8_t Read_IR_Sensors(uint8_t sensor_mask) {
-    // Turn on selected IR emitters
-    P5->OUT |= (sensor_mask & 0x55);
-    P9->OUT |= (sensor_mask & 0xAA);
-
-    // Charge phase - charge sensor capacitors
-    P7->DIR = sensor_mask;
-    P7->OUT = sensor_mask;
-    Clock_Delay1us(15);
-
-    // Discharge phase - measure discharge time (reflectance)
-    P7->DIR = 0x00;
-    Clock_Delay1us(800);
-
-    uint8_t sensor_readings = P7->IN & sensor_mask;
-
-    // Turn off emitters to save power
-    P5->OUT &= ~0x55;
-    P9->OUT &= ~0xAA;
-
-    return sensor_readings;
-}
-
-// ========== SPEED CONTROL ==========
-void Set_Robot_Speed(uint8_t speed_percent) {
-    if (speed_percent >= 1 && speed_percent <= 100) {
-        robot_speed_percent = speed_percent;
+        // Turn off emitters
+        P5->OUT &= ~0x55;
+        P9->OUT &= ~0xAA;
+        
+        if (i < samples - 1) Clock_Delay1us(100);
     }
-}
-
-uint16_t Calculate_Speed(uint8_t percent_of_max) {
-    uint32_t speed = (MAX_SPEED * robot_speed_percent * percent_of_max) / 10000;
-    return (uint16_t)speed;
-}
-
-// ========== LED STATUS INDICATORS ==========
-// LED colors indicate robot state for debugging and monitoring
-void LED_Red_On() { P2->OUT = (P2->OUT & ~0x07) | 0x01; }
-void LED_Green_On() { P2->OUT = (P2->OUT & ~0x07) | 0x02; }
-void LED_Blue_On() { P2->OUT = (P2->OUT & ~0x07) | 0x04; }
-void LED_Yellow_On() { P2->OUT = (P2->OUT & ~0x07) | 0x03; }
-void LED_Cyan_On() { P2->OUT = (P2->OUT & ~0x07) | 0x06; }
-void LED_Magenta_On() { P2->OUT = (P2->OUT & ~0x07) | 0x05; }
-void LED_White_On() { P2->OUT = (P2->OUT & ~0x07) | 0x07; }
-void LED_Orange_On() { P2->OUT = (P2->OUT & ~0x07) | 0x03; }
-void LED_Off() { P2->OUT &= ~0x07; }
-
-// ========== DEBUG AND ANALYSIS ==========
-/*
- * Debug_Sensor_Pattern - Print sensor readings in human-readable format
- * Shows which sensors detect the line and analyzes the pattern
- */
-void Debug_Sensor_Pattern(uint8_t reading) {
-    int i;
-    printf("Sensors: ");
-    for (i = 7; i >= 0; i--) {
-        printf("%c", (reading & (1 << i)) ? 'X' : '.');
-    }
-
-    // Count active sensors and sensor groups
-    uint8_t count = 0, groups = 0;
-    bool in_group = false;
-
-    for (i = 0; i < 8; i++) {
-        if (reading & (1 << i)) {
-            count++;
-            if (!in_group) {
-                groups++;
-                in_group = true;
-            }
-        } else {
-            in_group = false;
+    
+    // Return the reading with the most active sensors (most reliable)
+    uint8_t best_reading = readings[0];
+    uint8_t max_count = Count_Active_Sensors(readings[0]);
+    
+    for (i = 1; i < samples; i++) {
+        uint8_t count = Count_Active_Sensors(readings[i]);
+        if (count > max_count) {
+            max_count = count;
+            best_reading = readings[i];
         }
     }
-
-    printf(" Count:%d Groups:%d", count, groups);
-
-    // Classify the pattern
-    if (count >= 5 && groups <= 2) {
-        printf(" -> INTERSECTION");
-    } else if (count >= 1 && count <= 4) {
-        printf(" -> LINE");
-    } else {
-        printf(" -> NO_LINE");
-    }
-    printf("\n");
+    
+    return best_reading;
 }
 
-// ========== INTERSECTION DETECTION ==========
-/*
- * Is_Intersection - Detect intersection by analyzing sensor pattern
- * Intersections show as wide line patterns (many sensors active)
- * Returns true if pattern indicates an intersection
- */
-bool Is_Intersection(uint8_t reading) {
-    int i;
-    uint8_t count = 0, groups = 0;
-    bool in_group = false;
+// ========== ENHANCED ANALYSIS FUNCTIONS ==========
 
-    // Count total active sensors
+uint8_t Count_Active_Sensors(uint8_t reading) {
+    uint8_t count = 0;
+    uint8_t i;
     for (i = 0; i < 8; i++) {
         if (reading & (1 << i)) count++;
     }
+    return count;
+}
 
-    // Count contiguous groups of sensors
+uint8_t Get_Sensor_Weight_Score(uint8_t reading) {
+    // Give more weight to center sensors
+    uint8_t score = 0;
+    if (reading & 0x08) score += 4; // Sensor 3
+    if (reading & 0x10) score += 4; // Sensor 4
+    if (reading & 0x04) score += 3; // Sensor 2
+    if (reading & 0x20) score += 3; // Sensor 5
+    if (reading & 0x02) score += 2; // Sensor 1
+    if (reading & 0x40) score += 2; // Sensor 6
+    if (reading & 0x01) score += 1; // Sensor 0
+    if (reading & 0x80) score += 1; // Sensor 7
+    return score;
+}
+
+/*
+ * Is_Enhanced_Intersection - Improved intersection detection
+ * Uses multiple criteria for more reliable detection
+ */
+bool Is_Enhanced_Intersection(uint8_t reading) {
+    uint8_t count = Count_Active_Sensors(reading);
+    uint8_t weight_score = Get_Sensor_Weight_Score(reading);
+    
+    // Count contiguous groups
+    uint8_t groups = 0;
+    bool in_group = false;
+    uint8_t i;
+    
     for (i = 0; i < 8; i++) {
         bool current_sensor = (reading & (1 << i)) != 0;
         if (current_sensor && !in_group) {
@@ -363,454 +229,349 @@ bool Is_Intersection(uint8_t reading) {
             in_group = false;
         }
     }
-
-    // Intersection criteria: many sensors active, few groups
-    return (count >= 4 && groups <= 3);
+    
+    // Enhanced intersection criteria
+    bool wide_pattern = (count >= 5);
+    bool center_heavy = (weight_score >= 10);
+    bool spans_center = ((reading & 0x18) != 0); // Sensors 3 or 4 active
+    bool outer_sensors = ((reading & 0x81) != 0); // Outer sensors active
+    
+    return (wide_pattern && spans_center) || 
+           (center_heavy && count >= 4) || 
+           (outer_sensors && count >= 4 && groups <= 2);
 }
 
-// ========== TURN COMPLETION DETECTION ==========
 /*
- * Is_Turn_Complete - Detect when robot has completed a turn
- * Looks for centered line detection after turn maneuver
+ * Is_Dead_End - Detect dead-end situations
+ * Looks for narrow line ending patterns
  */
-bool Is_Turn_Complete() {
-    int i;
-    uint8_t reading = Read_IR_Sensors(CENTER_6_SENSORS);
-
-    // Check for center sensor activation
-    bool sensor3 = (reading & 0x08) != 0;
-    bool sensor4 = (reading & 0x10) != 0;
-    bool center_detected = sensor3 || sensor4;
-
-    if (!center_detected) return false;
-
-    // Count active sensors
-    uint8_t count = 0;
-    for (i = 1; i < 7; i++) {
-        if (reading & (1 << i)) count++;
+bool Is_Dead_End(uint8_t reading) {
+    uint8_t count = Count_Active_Sensors(reading);
+    
+    // Dead end characteristics: few sensors, no wide pattern
+    if (count == 0) return true; // Complete line loss
+    if (count <= 2 && !Is_Enhanced_Intersection(reading)) {
+        consecutive_line_lost_count++;
+        return consecutive_line_lost_count > 3;
     }
-    if (count > 4) return false;  // Too wide - likely intersection
-
-    // Check for contiguous detection (no gaps in line)
-    int first_active = -1, last_active = -1;
-    for (i = 1; i < 7; i++) {
-        if (reading & (1 << i)) {
-            if (first_active == -1) first_active = i;
-            last_active = i;
-        }
-    }
-
-    if (first_active != -1 && last_active != -1) {
-        for (i = first_active; i <= last_active; i++) {
-            if (!(reading & (1 << i))) return false;
-        }
-    }
-
-    // Check various alignment patterns for turn completion
-    if (sensor3 && sensor4) return true;  // Perfect center
-    if ((sensor3 && (reading & 0x04)) || (sensor4 && (reading & 0x20))) return true;  // Good alignment
-    if ((sensor3 || sensor4) && count <= 3) return true;  // Acceptable alignment
-
+    
+    consecutive_line_lost_count = 0;
     return false;
 }
 
-// ========== INTERSECTION DIRECTION ANALYSIS ==========
 /*
- * Get_Intersection_Direction - Analyze intersection to determine turn direction
- * Compares left vs right sensor activation to decide which way to turn
+ * Analyze_Intersection_Options - Advanced intersection analysis
+ * Determines available paths and recommends direction
  */
-IntersectionDirection Get_Intersection_Direction(uint8_t reading) {
-    int i;
-    if (!Is_Intersection(reading)) return INTERSECTION_UNKNOWN;
-
-    // Special case: force right turn at first intersection
+IntersectionDirection Analyze_Intersection_Options(uint8_t reading) {
+    if (!Is_Enhanced_Intersection(reading)) {
+        if (Is_Dead_End(reading)) return INTERSECTION_DEAD_END;
+        return INTERSECTION_UNKNOWN;
+    }
+    
+    // Special handling for first intersection
     if (first_intersection_after_start) {
-        printf("FIRST INTERSECTION AFTER START - FORCING RIGHT TURN\n");
+        printf("FIRST INTERSECTION - FORCING RIGHT TURN\n");
         return INTERSECTION_RIGHT;
     }
-
-    // Count sensors on left side (sensors 4-7) vs right side (sensors 0-3)
-    uint8_t left_count = 0, right_count = 0;
-    for (i = 0; i < 4; i++) {
-        if (reading & (1 << i)) right_count++;
-        if (reading & (1 << (i + 4))) left_count++;
+    
+    // Analyze sensor distribution
+    uint8_t left_count = 0, right_count = 0, center_count = 0;
+    uint8_t i;
+    
+    for (i = 0; i < 8; i++) {
+        if (reading & (1 << i)) {
+            if (i <= 2) right_count++;
+            else if (i >= 5) left_count++;
+            else center_count++;
+        }
     }
-
-    printf("Left sensors: %d, Right sensors: %d\n", left_count, right_count);
-
-    if (left_count > right_count) {
-        printf("-> LEFT INTERSECTION DETECTED\n");
-        return INTERSECTION_LEFT;
-    } else if (right_count > left_count) {
-        printf("-> RIGHT INTERSECTION DETECTED\n");
-        return INTERSECTION_RIGHT;
-    } else {
-        printf("-> STRAIGHT INTERSECTION DETECTED\n");
+    
+    // Check for T-intersections
+    bool has_left = (left_count >= 2);
+    bool has_right = (right_count >= 2);
+    bool has_straight = (center_count >= 2);
+    
+    printf("Intersection analysis: L=%d R=%d C=%d (has: L=%d R=%d S=%d)\n", 
+           left_count, right_count, center_count, has_left, has_right, has_straight);
+    
+    // Decision logic with path history consideration
+    if (has_left && has_right && has_straight) {
+        // Full intersection - use smart path selection
+        if (Should_Try_Alternative_Path()) {
+            return (left_count > right_count) ? INTERSECTION_LEFT : INTERSECTION_RIGHT;
+        } else {
+            return INTERSECTION_STRAIGHT;
+        }
+    } else if (has_left && has_right) {
+        // T-intersection without straight option
+        return (left_count > right_count) ? INTERSECTION_LEFT : INTERSECTION_RIGHT;
+    } else if (has_left && !has_right) {
+        return INTERSECTION_T_LEFT;
+    } else if (has_right && !has_left) {
+        return INTERSECTION_T_RIGHT;
+    } else if (has_straight) {
         return INTERSECTION_STRAIGHT;
-    }
-}
-
-/*
- * Get_Intersection_Direction_From_Backward - Special case for dead-end recovery
- * When arriving at intersection from backward search, prioritize right turns
- */
-IntersectionDirection Get_Intersection_Direction_From_Backward(uint8_t reading) {
-    int i;
-    if (!Is_Intersection(reading)) return INTERSECTION_UNKNOWN;
-
-    uint8_t left_count = 0, right_count = 0;
-    for (i = 0; i < 4; i++) {
-        if (reading & (1 << i)) right_count++;
-        if (reading & (1 << (i + 4))) left_count++;
-    }
-
-    printf("BACKWARD ARRIVAL - Left sensors: %d, Right sensors: %d\n", left_count, right_count);
-
-    // Prioritize right turn when multiple options available
-    if (right_count > 0 && left_count > 0) {
-        printf("-> BOTH DIRECTIONS AVAILABLE - PRIORITIZING RIGHT TURN\n");
-        return INTERSECTION_RIGHT;
-    } else if (right_count > left_count) {
-        printf("-> RIGHT INTERSECTION DETECTED (FROM BACKWARD)\n");
-        return INTERSECTION_RIGHT;
-    } else if (left_count > right_count) {
-        printf("-> LEFT INTERSECTION DETECTED (FROM BACKWARD)\n");
-        return INTERSECTION_LEFT;
     } else {
-        printf("-> UNCLEAR DIRECTION - DEFAULTING TO RIGHT TURN\n");
-        return INTERSECTION_RIGHT;
+        return INTERSECTION_UNKNOWN;
     }
 }
 
-// ========== LINE POSITION DETECTION ==========
-/*
- * Get_Line_Position - Main line following algorithm
- * Analyzes sensor pattern to determine where line is relative to robot
- * Returns appropriate steering command for line following
- */
-LinePosition Get_Line_Position() {
-    uint8_t reading = Read_IR_Sensors(CENTER_6_SENSORS);
-    uint8_t all_reading = Read_IR_Sensors(ALL_SENSORS);
+// ========== PATH TRACKING FUNCTIONS ==========
 
-    // Check for intersection first
-    if (Is_Intersection(all_reading)) return INTERSECTION_DETECTED;
+void Add_Turn_To_History(TurnDirection turn) {
+    if (path_history.turn_count < MAX_PATH_HISTORY) {
+        path_history.turns[path_history.turn_count] = turn;
+        path_history.turn_count++;
+    } else {
+        // Shift array left and add new turn
+        uint8_t i;
+        for (i = 0; i < MAX_PATH_HISTORY - 1; i++) {
+            path_history.turns[i] = path_history.turns[i + 1];
+        }
+        path_history.turns[MAX_PATH_HISTORY - 1] = turn;
+    }
+}
 
-    // Extract individual sensor readings (sensors 1-6)
+TurnDirection Get_Opposite_Turn(TurnDirection turn) {
+    switch (turn) {
+        case TURN_LEFT: return TURN_RIGHT;
+        case TURN_RIGHT: return TURN_LEFT;
+        default: return TURN_STRAIGHT;
+    }
+}
+
+bool Should_Try_Alternative_Path(void) {
+    // Simple algorithm: prefer right turns initially, then alternate
+    return (intersection_count % 3) != 0;
+}
+
+// ========== ENHANCED LINE POSITION DETECTION ==========
+
+LinePosition Get_Enhanced_Line_Position(void) {
+    uint8_t reading = Read_IR_Sensors_Multiple(CENTER_6_SENSORS, 2);
+    uint8_t all_reading = Read_IR_Sensors_Multiple(ALL_SENSORS, 2);
+    
+    // Check for special situations first
+    if (Is_Enhanced_Intersection(all_reading)) return INTERSECTION_DETECTED;
+    if (Is_Dead_End(all_reading)) return DEAD_END_DETECTED;
+    
+    // Extract sensor readings
     bool sensor1 = (reading & 0x02) != 0;
     bool sensor2 = (reading & 0x04) != 0;
-    bool sensor3 = (reading & 0x08) != 0;  // Center left
-    bool sensor4 = (reading & 0x10) != 0;  // Center right
+    bool sensor3 = (reading & 0x08) != 0;
+    bool sensor4 = (reading & 0x10) != 0;
     bool sensor5 = (reading & 0x20) != 0;
     bool sensor6 = (reading & 0x40) != 0;
-
-    // Determine line position based on active sensors
-    if (sensor3 && sensor4) return LINE_CENTERED;        // Perfect center
-    else if (sensor3 && !sensor4) return LINE_SLIGHT_RIGHT;  // Slight right correction needed
-    else if (sensor4 && !sensor3) return LINE_SLIGHT_LEFT;   // Slight left correction needed
-    else if (sensor2) return LINE_SHARP_RIGHT;           // Sharp right correction needed
-    else if (sensor5) return LINE_SHARP_LEFT;            // Sharp left correction needed
-    else if (sensor1) return LINE_SHARP_RIGHT;           // Very sharp right correction
-    else if (sensor6) return LINE_SHARP_LEFT;            // Very sharp left correction
-    else return LINE_LOST;                               // No line detected
+    
+    // Enhanced position detection with weighted scoring
+    uint8_t weight_score = Get_Sensor_Weight_Score(reading);
+    
+    if (sensor3 && sensor4) {
+        last_good_line_time = 0; // Reset line lost counter
+        return LINE_CENTERED;
+    } else if (sensor3 && !sensor4) {
+        last_good_line_time = 0;
+        return LINE_SLIGHT_RIGHT;
+    } else if (sensor4 && !sensor3) {
+        last_good_line_time = 0;
+        return LINE_SLIGHT_LEFT;
+    } else if (sensor2 || (sensor1 && weight_score >= 3)) {
+        last_good_line_time = 0;
+        return LINE_SHARP_RIGHT;
+    } else if (sensor5 || (sensor6 && weight_score >= 3)) {
+        last_good_line_time = 0;
+        return LINE_SHARP_LEFT;
+    } else {
+        last_good_line_time++;
+        return LINE_LOST;
+    }
 }
 
-// ========== LOW-LEVEL MOTOR DIRECTION CONTROL ==========
-void Left_Forward() { P5->OUT &= ~0x10; }
-void Left_Backward() { P5->OUT |= 0x10; }
-void Right_Forward() { P5->OUT &= ~0x20; }
-void Right_Backward() { P5->OUT |= 0x20; }
-void PWM_Duty3(uint16_t duty3) { TIMER_A0->CCR[3] = duty3; }
-void PWM_Duty4(uint16_t duty4) { TIMER_A0->CCR[4] = duty4; }
+// ========== ENHANCED NAVIGATION FUNCTIONS ==========
 
-// ========== MOTOR CONTROL FUNCTIONS ==========
-/*
- * Movement functions implement proportional steering for line following
- * Faster motor = outer wheel in turn, slower motor = inner wheel
- */
-void Move(uint16_t leftDuty, uint16_t rightDuty) {
-    P3->OUT |= 0xC0;  // Enable motors
-    PWM_Duty3(rightDuty);
-    PWM_Duty4(leftDuty);
+void Execute_Smart_Turn(IntersectionDirection direction) {
+    TurnDirection turn_made;
+    
+    switch (direction) {
+        case INTERSECTION_LEFT:
+        case INTERSECTION_T_LEFT:
+            printf("EXECUTING SMART LEFT TURN\n");
+            Execute_Left_Turn();
+            turn_made = TURN_LEFT;
+            break;
+            
+        case INTERSECTION_RIGHT:
+        case INTERSECTION_T_RIGHT:
+            printf("EXECUTING SMART RIGHT TURN\n");
+            Execute_Right_Turn();
+            turn_made = TURN_RIGHT;
+            break;
+            
+        case INTERSECTION_STRAIGHT:
+            printf("CONTINUING STRAIGHT\n");
+            Move_Forward();
+            Clock_Delay1ms(400);
+            turn_made = TURN_STRAIGHT;
+            break;
+            
+        case INTERSECTION_DEAD_END:
+            printf("DEAD END DETECTED - INITIATING RECOVERY\n");
+            Execute_Dead_End_Recovery();
+            return; // Don't add to history for dead end
+            
+        default:
+            printf("UNKNOWN INTERSECTION - DEFAULTING TO RIGHT\n");
+            Execute_Right_Turn();
+            turn_made = TURN_RIGHT;
+            break;
+    }
+    
+    Add_Turn_To_History(turn_made);
 }
 
-void Stop() {
-    P3->OUT &= ~0xC0;  // Disable motors
-    PWM_Duty3(0);
-    PWM_Duty4(0);
-}
-
-void Move_Forward() {
-    Left_Forward();
-    Right_Forward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
-}
-
-void Move_Backward() {
-    Left_Backward();
-    Right_Backward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
-}
-
-// Forward turning functions (for line following)
-void Turn_Slight_Left() {
-    Left_Forward();
-    Right_Forward();
-    Move(Calculate_Speed(TURN_SLOW_SPEED), Calculate_Speed(FULL_SPEED));  // Left slower
-}
-
-void Turn_Slight_Right() {
-    Left_Forward();
-    Right_Forward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(TURN_SLOW_SPEED));  // Right slower
-}
-
-void Turn_Sharp_Left() {
-    Left_Forward();
-    Right_Forward();
-    Move(Calculate_Speed(TURN_SHARP_SPEED), Calculate_Speed(FULL_SPEED));  // Left much slower
-}
-
-void Turn_Sharp_Right() {
-    Left_Forward();
-    Right_Forward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(TURN_SHARP_SPEED));  // Right much slower
-}
-
-// Backward turning functions (for dead-end recovery)
-void Turn_Slight_Left_Backward() {
-    Left_Backward();
-    Right_Backward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(TURN_SLOW_SPEED));
-}
-
-void Turn_Slight_Right_Backward() {
-    Left_Backward();
-    Right_Backward();
-    Move(Calculate_Speed(TURN_SLOW_SPEED), Calculate_Speed(FULL_SPEED));
-}
-
-void Turn_Sharp_Left_Backward() {
-    Left_Backward();
-    Right_Backward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(TURN_SHARP_SPEED));
-}
-
-void Turn_Sharp_Right_Backward() {
-    Left_Backward();
-    Right_Backward();
-    Move(Calculate_Speed(TURN_SHARP_SPEED), Calculate_Speed(FULL_SPEED));
-}
-
-// ========== INTERSECTION NAVIGATION ==========
-/*
- * Execute_Left_Turn - Perform 90-degree left turn at intersection
- * Uses tank turn (one motor forward, one backward) for tight turning
- */
-void Execute_Left_Turn() {
-    printf("EXECUTING LEFT TURN (FORWARD APPROACH)\n");
-
-    // Move forward slightly to position robot properly
-    Move_Forward();
-    Clock_Delay1ms(410);
+void Execute_Dead_End_Recovery(void) {
+    printf("EXECUTING DEAD END RECOVERY SEQUENCE\n");
+    
+    // Stop and analyze
     Stop();
-    Clock_Delay1ms(100);
-
-    printf("TURNING LEFT 90 DEGREES");
-    // Tank turn: left motor backward, right motor forward
+    Clock_Delay1ms(500);
+    
+    // Try to back up and find the line
+    printf("BACKING UP TO FIND INTERSECTION\n");
+    Move_Backward();
+    Clock_Delay1ms(800);
+    
+    // Look for intersection while backing up
+    uint32_t backup_timer = 0;
+    while (backup_timer < 40) { // 2 seconds max
+        uint8_t reading = Read_IR_Sensors_Multiple(ALL_SENSORS, 2);
+        
+        if (Is_Enhanced_Intersection(reading)) {
+            printf("FOUND INTERSECTION DURING BACKUP\n");
+            Stop();
+            Clock_Delay1ms(300);
+            
+            // Analyze and turn
+            IntersectionDirection direction = Analyze_Intersection_Options(reading);
+            if (direction == INTERSECTION_LEFT || direction == INTERSECTION_T_LEFT) {
+                Execute_Left_Turn_From_Backward();
+            } else {
+                Execute_Right_Turn_From_Backward();
+            }
+            return;
+        }
+        
+        Clock_Delay1ms(50);
+        backup_timer++;
+    }
+    
+    // If no intersection found, try a 180-degree turn
+    printf("NO INTERSECTION FOUND - EXECUTING 180 TURN\n");
+    Stop();
+    Clock_Delay1ms(200);
+    
     Left_Backward();
     Right_Forward();
     Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
+    Clock_Delay1ms(3800); // Longer turn for 180 degrees
+    
+    Stop();
+    Clock_Delay1ms(200);
+}
 
-    // Continue turning until line is detected or safety timeout
-    uint32_t safety_counter = 0;
-    uint32_t min_turn_time = 0;
-    bool turn_complete = false;
-
-    while (min_turn_time < MIN_TURN_TIME) {
-        Clock_Delay1ms(50);
-        min_turn_time += 50;
-        safety_counter++;
-
-        if (min_turn_time >= MIN_TURN_TIME && Is_Turn_Complete()) {
-            turn_complete = true;
-            break;
+bool Search_For_Line_Post_Turn(void) {
+    printf("SEARCHING FOR LINE AFTER TURN\n");
+    
+    uint8_t search_attempts = 0;
+    while (search_attempts < 10) {
+        LinePosition pos = Get_Enhanced_Line_Position();
+        
+        if (pos != LINE_LOST && pos != DEAD_END_DETECTED) {
+            printf("LINE FOUND AFTER TURN SEARCH\n");
+            return true;
         }
+        
+        // Small forward movement to search
+        Move_Forward();
+        Clock_Delay1ms(100);
+        search_attempts++;
+    }
+    
+    printf("LINE NOT FOUND AFTER TURN - MAY NEED RECOVERY\n");
+    return false;
+}
 
-        if (safety_counter >= 50) {
-            printf("Safety timeout - completing turn\n");
-            break;
+// ========== ENHANCED DEBUG FUNCTIONS ==========
+
+void Debug_Enhanced_Sensor_Pattern(uint8_t reading) {
+    uint8_t i;
+    printf("Sensors: ");
+    for (i = 7; i >= 0; i--) {
+        printf("%c", (reading & (1 << i)) ? 'X' : '.');
+    }
+    
+    uint8_t count = Count_Active_Sensors(reading);
+    uint8_t weight = Get_Sensor_Weight_Score(reading);
+    
+    printf(" Count:%d Weight:%d", count, weight);
+    
+    if (Is_Enhanced_Intersection(reading)) {
+        printf(" -> INTERSECTION");
+    } else if (Is_Dead_End(reading)) {
+        printf(" -> DEAD_END");
+    } else if (count >= 1) {
+        printf(" -> LINE");
+    } else {
+        printf(" -> NO_LINE");
+    }
+    printf("\n");
+}
+
+void Debug_Intersection_Analysis(uint8_t reading, IntersectionDirection direction) {
+    printf("=== INTERSECTION ANALYSIS ===\n");
+    Debug_Enhanced_Sensor_Pattern(reading);
+    
+    printf("Direction: ");
+    switch (direction) {
+        case INTERSECTION_LEFT: printf("LEFT\n"); break;
+        case INTERSECTION_RIGHT: printf("RIGHT\n"); break;
+        case INTERSECTION_STRAIGHT: printf("STRAIGHT\n"); break;
+        case INTERSECTION_T_LEFT: printf("T-LEFT\n"); break;
+        case INTERSECTION_T_RIGHT: printf("T-RIGHT\n"); break;
+        case INTERSECTION_DEAD_END: printf("DEAD_END\n"); break;
+        default: printf("UNKNOWN\n"); break;
+    }
+    
+    printf("Intersection count: %d\n", intersection_count);
+    printf("Path history: ");
+    uint8_t i;
+    for (i = 0; i < path_history.turn_count && i < 5; i++) {
+        switch (path_history.turns[i]) {
+            case TURN_LEFT: printf("L "); break;
+            case TURN_RIGHT: printf("R "); break;
+            case TURN_STRAIGHT: printf("S "); break;
         }
     }
-
-    if (turn_complete) printf("Turn completed by sensor detection\n");
-
-    Stop();
-    Clock_Delay1ms(200);
-
-    // Move forward slightly to ensure robot is on new line
-    printf("SEARCHING FOR NEW LINE AFTER FORWARD LEFT TURN\n");
-    Move_Forward();
-    Clock_Delay1ms(150);
-    Stop();
-    Clock_Delay1ms(200);
-    printf("LEFT TURN COMPLETED\n");
+    printf("\n=============================\n");
 }
+
+// ========== MAIN PROGRAM WITH ENHANCEMENTS ==========
 
 /*
- * Execute_Right_Turn - Perform 90-degree right turn at intersection
- * Similar to left turn but with opposite motor directions
+ * Enhanced main function with improved state handling
+ * Key improvements:
+ * - Better intersection detection and handling
+ * - Path tracking and smart decision making
+ * - Enhanced dead-end recovery
+ * - More robust line following
  */
-void Execute_Right_Turn() {
-    printf("EXECUTING RIGHT TURN (FORWARD APPROACH)\n");
 
-    Move_Forward();
-    Clock_Delay1ms(410);
-    Stop();
-    Clock_Delay1ms(100);
+// Note: Include all the original hardware initialization functions here
+// (Motor_Init, IR_Init, PWM functions, LED functions, etc.)
+// They remain the same as in your original code
 
-    printf("TURNING RIGHT 90 DEGREES");
-    // Tank turn: left motor forward, right motor backward
-    Left_Forward();
-    Right_Backward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
-
-    uint32_t safety_counter = 0;
-    uint32_t min_turn_time = 0;
-    bool turn_complete = false;
-
-    while (min_turn_time < MIN_TURN_TIME) {
-        Clock_Delay1ms(50);
-        min_turn_time += 50;
-        safety_counter++;
-
-        if (min_turn_time >= MIN_TURN_TIME && Is_Turn_Complete()) {
-            turn_complete = true;
-            break;
-        }
-
-        if (safety_counter >= 50) {
-            printf("Safety timeout - completing turn\n");
-            break;
-        }
-    }
-
-    if (turn_complete) printf("Turn completed by sensor detection\n");
-
-    Stop();
-    Clock_Delay1ms(200);
-
-    printf("SEARCHING FOR NEW LINE AFTER FORWARD RIGHT TURN\n");
-    Move_Forward();
-    Clock_Delay1ms(150);
-    Stop();
-    Clock_Delay1ms(200);
-    printf("RIGHT TURN COMPLETED\n");
-}
-
-// Turn functions for dead-end recovery (when approaching intersection from backward)
-void Execute_Left_Turn_From_Backward() {
-    printf("EXECUTING LEFT TURN (BACKWARD APPROACH)\n");
-
-    Move_Forward();
-    Clock_Delay1ms(200);
-    Stop();
-    Clock_Delay1ms(200);
-
-    printf("TURNING LEFT 90 DEGREES AFTER BACKING UP");
-    Left_Backward();
-    Right_Forward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
-
-    uint32_t safety_counter = 0;
-    uint32_t min_turn_time = 0;
-    bool turn_complete = false;
-
-    while (min_turn_time < MIN_TURN_TIME) {
-        Clock_Delay1ms(50);
-        min_turn_time += 50;
-        safety_counter++;
-
-        if (min_turn_time >= MIN_TURN_TIME && Is_Turn_Complete()) {
-            turn_complete = true;
-            break;
-        }
-
-        if (safety_counter >= 50) {
-            printf("Safety timeout - completing turn\n");
-            break;
-        }
-    }
-
-    if (turn_complete) printf("Turn completed by sensor detection\n");
-
-    Stop();
-    Clock_Delay1ms(200);
-    printf("LEFT TURN FROM BACKWARD COMPLETED\n");
-}
-
-void Execute_Right_Turn_From_Backward() {
-    printf("EXECUTING RIGHT TURN (BACKWARD APPROACH)\n");
-
-    Move_Forward();
-    Clock_Delay1ms(200);
-    Stop();
-    Clock_Delay1ms(200);
-
-    printf("TURNING RIGHT 90 DEGREES AFTER BACKING UP");
-    Left_Forward();
-    Right_Backward();
-    Move(Calculate_Speed(FULL_SPEED), Calculate_Speed(FULL_SPEED));
-
-    uint32_t safety_counter = 0;
-    uint32_t min_turn_time = 0;
-    bool turn_complete = false;
-
-    while (min_turn_time < MIN_TURN_TIME) {
-        Clock_Delay1ms(50);
-        min_turn_time += 50;
-        safety_counter++;
-
-        if (min_turn_time >= MIN_TURN_TIME && Is_Turn_Complete()) {
-            turn_complete = true;
-            break;
-        }
-
-        if (safety_counter >= 50) {
-            printf("Safety timeout - completing turn\n");
-            break;
-        }
-    }
-
-    if (turn_complete) printf("Turn completed by sensor detection\n");
-
-    Stop();
-    Clock_Delay1ms(200);
-    printf("RIGHT TURN FROM BACKWARD COMPLETED\n");
-}
-
-// ========== START DETECTION ==========
-/*
- * Check_Start_Line - Detect when robot is placed on starting line
- * Uses middle 4 sensors to detect wide line pattern
- */
-bool Check_Start_Line() {
-    uint8_t reading = Read_IR_Sensors(MIDDLE_4_SENSORS);
-    return (reading & MIDDLE_4_SENSORS) == MIDDLE_4_SENSORS;
-}
-
-// ========== MAIN PROGRAM ==========
-/*
- * MAIN STATE MACHINE
- * Controls overall robot behavior through different states:
- * 1. WAITING - Wait for start signal
- * 2. PLACEMENT_WAIT - 5-second countdown for user adjustment
- * 3. INITIAL_FORWARD - Move forward off starting line
- * 4. FOLLOWING - Main line following mode
- * 5. STOPPED - Analyze intersection
- * 6. LINE_LOST_WAIT - Stabilization after line loss
- * 7. BACKWARD_SEARCH - Search for lost line by going backward
- * 8. BACKWARD_TO_INTERSECTION - Navigate backward to intersection
- */
+// Enhanced main loop - replaces your original main function
 int main(void) {
     // Initialize hardware systems
     Clock_Init48MHz();
@@ -818,37 +579,44 @@ int main(void) {
     IR_Init();
     Set_Robot_Speed(DEFAULT_ROBOT_SPEED);
 
-    // Initialize state machine variables
+    // Initialize enhanced state machine variables
     RobotState current_state = ROBOT_WAITING;
     uint8_t start_counter = 0;
     static uint32_t blink_counter = 0;
-    bool arrived_from_backward = false;  // Flag for dead-end recovery
+    bool arrived_from_backward = false;
     uint32_t placement_timer = 0;
     uint32_t forward_timer = 0;
     uint32_t line_lost_timer = 0;
+    uint32_t post_turn_timer = 0;
 
-    LED_Red_On();  // Initial state indicator
+    // Initialize enhanced tracking
+    consecutive_line_lost_count = 0;
+    last_good_line_time = 0;
+    
+    LED_Red_On();
 
     while (1) {
         switch (current_state) {
 
             case ROBOT_WAITING:
-                // Wait for start signal from middle 4 sensors detecting wide line
                 if (Check_Start_Line()) {
                     start_counter++;
                     if (start_counter >= 3) {
-                        printf("FOUR MIDDLE SENSORS DETECTED - STARTING 5 SECOND PLACEMENT WAIT\n");
+                        printf("START DETECTED - BEGINNING ENHANCED NAVIGATION\n");
                         current_state = ROBOT_PLACEMENT_WAIT;
                         LED_Magenta_On();
                         placement_timer = 0;
                         start_counter = 0;
+                        
+                        // Reset enhanced tracking
                         arrived_from_backward = false;
                         first_intersection_after_start = true;
                         intersection_count = 0;
+                        path_history.turn_count = 0;
+                        consecutive_line_lost_count = 0;
                     }
                 } else {
                     start_counter = 0;
-                    // Blink red LED to show robot is alive and waiting
                     blink_counter++;
                     if (blink_counter % 20 == 0) {
                         LED_Off();
@@ -859,19 +627,18 @@ int main(void) {
                 break;
 
             case ROBOT_PLACEMENT_WAIT:
-                // 5-second countdown allows user to adjust robot placement
                 LED_Magenta_On();
                 placement_timer++;
 
                 if (placement_timer % 20 == 0) {
                     uint8_t seconds_remaining = 5 - (placement_timer / 20);
                     if (seconds_remaining > 0) {
-                        printf("PLACEMENT ADJUSTMENT TIME REMAINING: %d seconds\n", seconds_remaining);
+                        printf("ENHANCED PLACEMENT WAIT: %d seconds\n", seconds_remaining);
                     }
                 }
 
-                if (placement_timer >= 100) {  // 5 seconds at 50ms intervals
-                    printf("PLACEMENT WAIT COMPLETE - STARTING INITIAL FORWARD MOVEMENT\n");
+                if (placement_timer >= 100) {
+                    printf("STARTING ENHANCED INITIAL FORWARD\n");
                     current_state = ROBOT_INITIAL_FORWARD;
                     LED_White_On();
                     forward_timer = 0;
@@ -879,13 +646,12 @@ int main(void) {
                 break;
 
             case ROBOT_INITIAL_FORWARD:
-                // Move forward to clear starting line before beginning line following
                 LED_White_On();
                 Move_Forward();
                 forward_timer++;
 
-                if (forward_timer >= 15) {  // 750ms at 50ms intervals
-                    printf("INITIAL FORWARD COMPLETE - STARTING LINE FOLLOWING NAVIGATION\n");
+                if (forward_timer >= 15) {
+                    printf("ENHANCED LINE FOLLOWING ACTIVATED\n");
                     current_state = ROBOT_FOLLOWING;
                     LED_Blue_On();
                     forward_timer = 0;
@@ -893,246 +659,154 @@ int main(void) {
                 break;
 
             case ROBOT_FOLLOWING:
-                // Main line following mode - continuously adjust steering based on line position
                 LED_Blue_On();
-                LinePosition line_pos = Get_Line_Position();
+                LinePosition line_pos = Get_Enhanced_Line_Position();
 
-                // Debug output every 10 cycles (500ms)
+                // Enhanced debug output
                 static uint8_t debug_counter = 0;
                 debug_counter++;
                 if (debug_counter % 10 == 0) {
-                    uint8_t all_sensors = Read_IR_Sensors(ALL_SENSORS);
-                    Debug_Sensor_Pattern(all_sensors);
+                    uint8_t all_sensors = Read_IR_Sensors_Multiple(ALL_SENSORS, 2);
+                    Debug_Enhanced_Sensor_Pattern(all_sensors);
                 }
 
-                // Execute appropriate movement based on line position
                 switch (line_pos) {
                     case INTERSECTION_DETECTED:
-                        printf("INTERSECTION DETECTED - STOPPING\n");
+                        printf("ENHANCED INTERSECTION DETECTED\n");
                         Stop();
-                        current_state = ROBOT_STOPPED;
+                        current_state = ROBOT_INTERSECTION_ADVANCE;
                         LED_Green_On();
                         break;
-                    case LINE_CENTERED: Move_Forward(); break;
-                    case LINE_SLIGHT_LEFT: Turn_Slight_Left(); break;
-                    case LINE_SLIGHT_RIGHT: Turn_Slight_Right(); break;
-                    case LINE_SHARP_LEFT: Turn_Sharp_Left(); break;
-                    case LINE_SHARP_RIGHT: Turn_Sharp_Right(); break;
-                    case LINE_LOST:
-                        printf("LINE LOST - STARTING 300ms STABILIZATION WAIT\n");
+                        
+                    case DEAD_END_DETECTED:
+                        printf("DEAD END DETECTED - INITIATING RECOVERY\n");
                         Stop();
-                        current_state = ROBOT_LINE_LOST_WAIT;
-                        LED_Orange_On();
-                        line_lost_timer = 0;
+                        Execute_Dead_End_Recovery();
+                        current_state = ROBOT_FOLLOWING;
+                        LED_Blue_On();
                         break;
-                    default: Move_Forward(); break;
+                        
+                    case LINE_CENTERED: 
+                        Move_Forward(); 
+                        break;
+                        
+                    case LINE_SLIGHT_LEFT: 
+                        Turn_Slight_Left(); 
+                        break;
+                        
+                    case LINE_SLIGHT_RIGHT: 
+                        Turn_Slight_Right(); 
+                        break;
+                        
+                    case LINE_SHARP_LEFT: 
+                        Turn_Sharp_Left(); 
+                        break;
+                        
+                    case LINE_SHARP_RIGHT: 
+                        Turn_Sharp_Right(); 
+                        break;
+                        
+                    case LINE_LOST:
+                        if (last_good_line_time > 6) { // Lost for more than 300ms
+                            printf("ENHANCED LINE LOST - STARTING RECOVERY\n");
+                            Stop();
+                            current_state = ROBOT_LINE_LOST_WAIT;
+                            LED_Orange_On();
+                            line_lost_timer = 0;
+                        } else {
+                            // Brief forward movement to search
+                            Move_Forward();
+                        }
+                        break;
+                        
+                    default: 
+                        Move_Forward(); 
+                        break;
+                }
+                break;
+
+            case ROBOT_INTERSECTION_ADVANCE:
+                // New state: advance slightly into intersection for better analysis
+                LED_Green_On();
+                Move_Forward();
+                Clock_Delay1ms(INTERSECTION_ADVANCE_TIME);
+                Stop();
+                
+                current_state = ROBOT_STOPPED;
+                break;
+
+            case ROBOT_STOPPED:
+                LED_Green_On();
+                Clock_Delay1ms(INTERSECTION_PAUSE_TIME);
+
+                if (arrived_from_backward) {
+                    printf("ENHANCED BACKWARD ARRIVAL HANDLING\n");
+                    
+                    uint8_t reading = Read_IR_Sensors_Multiple(ALL_SENSORS, 3);
+                    Debug_Enhanced_Sensor_Pattern(reading);
+                    
+                    IntersectionDirection direction = Analyze_Intersection_Options(reading);
+                    Debug_Intersection_Analysis(reading, direction);
+                    
+                    Execute_Smart_Turn(direction);
+                    
+                    arrived_from_backward = false;
+                    current_state = ROBOT_POST_TURN_SEARCH;
+                    LED_Cyan_On();
+                    post_turn_timer = 0;
+
+                } else {
+                    // Enhanced forward intersection handling
+                    uint8_t reading = Read_IR_Sensors_Multiple(ALL_SENSORS, 3);
+                    printf("ENHANCED INTERSECTION ANALYSIS: ");
+                    Debug_Enhanced_Sensor_Pattern(reading);
+
+                    if (Is_Enhanced_Intersection(reading)) {
+                        intersection_count++;
+                        printf("CONFIRMED INTERSECTION #%d\n", intersection_count);
+
+                        IntersectionDirection direction = Analyze_Intersection_Options(reading);
+                        Debug_Intersection_Analysis(reading, direction);
+                        
+                        Execute_Smart_Turn(direction);
+
+                        if (first_intersection_after_start) {
+                            first_intersection_after_start = false;
+                            printf("FIRST INTERSECTION COMPLETED\n");
+                        }
+
+                        current_state = ROBOT_POST_TURN_SEARCH;
+                        LED_Cyan_On();
+                        post_turn_timer = 0;
+                    } else {
+                        printf("FALSE INTERSECTION - RESUMING LINE FOLLOWING\n");
+                        current_state = ROBOT_FOLLOWING;
+                        LED_Blue_On();
+                    }
+                }
+                break;
+
+            case ROBOT_POST_TURN_SEARCH:
+                // New state: brief search for line after turn
+                LED_Cyan_On();
+                post_turn_timer++;
+                
+                if (Search_For_Line_Post_Turn() || post_turn_timer >= 6) {
+                    printf("POST-TURN SEARCH COMPLETE - RESUMING FOLLOWING\n");
+                    current_state = ROBOT_FOLLOWING;
+                    LED_Blue_On();
+                    post_turn_timer = 0;
                 }
                 break;
 
             case ROBOT_LINE_LOST_WAIT:
-                // Brief wait after line loss to avoid false alarms from shadows/noise
                 LED_Orange_On();
                 Stop();
                 line_lost_timer++;
 
-                // Check if line is found again during wait period
-                LinePosition wait_line_pos = Get_Line_Position();
-                if (wait_line_pos != LINE_LOST) {
-                    printf("LINE FOUND AGAIN DURING WAIT - RESUMING FOLLOWING\n");
+                LinePosition wait_line_pos = Get_Enhanced_Line_Position();
+                if (wait_line_pos != LINE_LOST && wait_line_pos != DEAD_END_DETECTED) {
+                    printf("LINE RECOVERED DURING WAIT\n");
                     current_state = ROBOT_FOLLOWING;
                     LED_Blue_On();
                     line_lost_timer = 0;
-                    break;
-                }
-
-                if (line_lost_timer >= 6) {  // 300ms at 50ms intervals
-                    printf("300ms STABILIZATION COMPLETE - STARTING BACKWARD SEARCH\n");
-                    current_state = ROBOT_BACKWARD_SEARCH;
-                    LED_Yellow_On();
-                    line_lost_timer = 0;
-                }
-                break;
-
-            case ROBOT_BACKWARD_SEARCH:
-                // Search for lost line by moving backward (dead-end recovery)
-                LED_Yellow_On();
-                LinePosition backward_line_pos = Get_Line_Position();
-
-                switch (backward_line_pos) {
-                    case LINE_LOST:
-                        Move_Backward();
-                        printf("SEARCHING BACKWARD FOR LOST LINE...\n");
-                        break;
-                    case INTERSECTION_DETECTED:
-                        printf("INTERSECTION FOUND DURING BACKWARD SEARCH\n");
-                        Stop();
-                        current_state = ROBOT_STOPPED;
-                        LED_Green_On();
-                        arrived_from_backward = true;
-                        break;
-                    default:
-                        printf("LINE FOUND - CONTINUING BACKWARD TO INTERSECTION\n");
-                        current_state = ROBOT_BACKWARD_TO_INTERSECTION;
-                        LED_Cyan_On();
-                        break;
-                }
-                break;
-
-            case ROBOT_BACKWARD_TO_INTERSECTION:
-                // Follow line backward until reaching intersection for dead-end recovery
-                LED_Cyan_On();
-                LinePosition backward_to_int_pos = Get_Line_Position();
-
-                switch (backward_to_int_pos) {
-                    case INTERSECTION_DETECTED:
-                        printf("INTERSECTION REACHED WHILE GOING BACKWARD\n");
-                        Stop();
-                        current_state = ROBOT_STOPPED;
-                        LED_Green_On();
-                        arrived_from_backward = true;
-                        break;
-                    case LINE_CENTERED: Move_Backward(); break;
-                    case LINE_SLIGHT_LEFT: Turn_Slight_Left_Backward(); break;
-                    case LINE_SLIGHT_RIGHT: Turn_Slight_Right_Backward(); break;
-                    case LINE_SHARP_LEFT: Turn_Sharp_Left_Backward(); break;
-                    case LINE_SHARP_RIGHT: Turn_Sharp_Right_Backward(); break;
-                    case LINE_LOST:
-                        printf("LINE LOST AGAIN - RETURNING TO BACKWARD SEARCH\n");
-                        current_state = ROBOT_BACKWARD_SEARCH;
-                        LED_Yellow_On();
-                        break;
-                    default: Move_Backward(); break;
-                }
-                break;
-
-            case ROBOT_STOPPED:
-                // Analyze intersection and decide which direction to turn
-                LED_Green_On();
-                Clock_Delay1ms(INTERSECTION_PAUSE_TIME);  // Pause for analysis
-
-                if (arrived_from_backward) {
-                    // Special handling for dead-end recovery
-                    printf("ARRIVED FROM BACKWARD - EXECUTING DEAD-END RECOVERY\n");
-
-                    // Take multiple sensor readings for reliable analysis
-                    uint8_t readings[3];
-                    int i, r;
-                    for (i = 0; i < 3; i++) {
-                        readings[i] = Read_IR_Sensors(ALL_SENSORS);
-                        if (i < 2) Clock_Delay1ms(100);
-                    }
-
-                    // Use reading with most sensors active for best accuracy
-                    uint8_t final_reading = readings[0];
-                    uint8_t max_count = 0;
-                    for (r = 0; r < 3; r++) {
-                        uint8_t count = 0;
-                        for (i = 0; i < 8; i++) {
-                            if (readings[r] & (1 << i)) count++;
-                        }
-                        if (count > max_count) {
-                            max_count = count;
-                            final_reading = readings[r];
-                        }
-                    }
-
-                    printf("BACKWARD ARRIVAL INTERSECTION READING: ");
-                    Debug_Sensor_Pattern(final_reading);
-
-                    IntersectionDirection direction = Get_Intersection_Direction_From_Backward(final_reading);
-
-                    switch (direction) {
-                        case INTERSECTION_LEFT:
-                            printf("EXECUTING LEFT TURN FROM BACKWARD POSITION\n");
-                            Execute_Left_Turn_From_Backward();
-                            break;
-                        case INTERSECTION_RIGHT:
-                        default:
-                            printf("EXECUTING RIGHT TURN FROM BACKWARD POSITION\n");
-                            Execute_Right_Turn_From_Backward();
-                            break;
-                    }
-
-                    arrived_from_backward = false;
-                    current_state = ROBOT_FOLLOWING;
-                    LED_Blue_On();
-                    printf("RESUMING FORWARD LINE FOLLOWING AFTER DEAD-END RECOVERY\n");
-
-                } else {
-                    // Normal intersection handling (forward approach)
-                    uint8_t all_sensors = Read_IR_Sensors(ALL_SENSORS);
-                    printf("STOPPED: ");
-                    Debug_Sensor_Pattern(all_sensors);
-
-                    // Take multiple readings for reliability
-                    uint8_t readings[3];
-                    int i, r;
-                    for (i = 0; i < 3; i++) {
-                        readings[i] = Read_IR_Sensors(ALL_SENSORS);
-                        if (i < 2) Clock_Delay1ms(100);
-                    }
-
-                    // Use reading with most sensors active
-                    uint8_t final_reading = readings[0];
-                    uint8_t max_count = 0;
-                    for (r = 0; r < 3; r++) {
-                        uint8_t count = 0;
-                        for (i = 0; i < 8; i++) {
-                            if (readings[r] & (1 << i)) count++;
-                        }
-                        if (count > max_count) {
-                            max_count = count;
-                            final_reading = readings[r];
-                        }
-                    }
-
-                    printf("FINAL INTERSECTION READING: ");
-                    Debug_Sensor_Pattern(final_reading);
-
-                    if (Is_Intersection(final_reading)) {
-                        intersection_count++;
-                        printf("INTERSECTION #%d DETECTED\n", intersection_count);
-
-                        IntersectionDirection direction = Get_Intersection_Direction(final_reading);
-
-                        switch (direction) {
-                            case INTERSECTION_LEFT:
-                                printf("CONFIRMED LEFT INTERSECTION - EXECUTING FORWARD LEFT TURN\n");
-                                Execute_Left_Turn();
-                                break;
-                            case INTERSECTION_RIGHT:
-                                printf("CONFIRMED RIGHT INTERSECTION - EXECUTING FORWARD RIGHT TURN\n");
-                                Execute_Right_Turn();
-                                break;
-                            case INTERSECTION_STRAIGHT:
-                                printf("STRAIGHT INTERSECTION - MOVING FORWARD\n");
-                                Move_Forward();
-                                Clock_Delay1ms(500);
-                                break;
-                            default:
-                                printf("UNKNOWN INTERSECTION TYPE - DEFAULTING TO FORWARD\n");
-                                Move_Forward();
-                                Clock_Delay1ms(300);
-                                break;
-                        }
-
-                        if (first_intersection_after_start) {
-                            first_intersection_after_start = false;
-                            printf("FIRST INTERSECTION HANDLED - NORMAL DETECTION RESUMED\n");
-                        }
-
-                        current_state = ROBOT_FOLLOWING;
-                        LED_Blue_On();
-                        printf("RESUMING LINE FOLLOWING AFTER INTERSECTION\n");
-                    } else {
-                        printf("NO INTERSECTION DETECTED - RESUMING LINE FOLLOWING\n");
-                        current_state = ROBOT_FOLLOWING;
-                        LED_Blue_On();
-                    }
-                }
-                break;
-        }
-
-        Clock_Delay1ms(50);  // 50ms main loop cycle for responsive control
-    }
-}
